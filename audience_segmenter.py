@@ -24,14 +24,16 @@ def validate_sample_sizes(prompted, unprompted, total):
         return False, "Sample sizes must be positive numbers"
     return True, ""
 
-def assign_nested_quotas(df_subset: pd.DataFrame, level_configs: List[Dict], constraint_columns: List[str]) -> pd.DataFrame:
+def assign_nested_quotas(df_subset: pd.DataFrame, level_configs: List[Dict], 
+                        constraint_columns: List[str], constraint_mappings: Dict[str, str]) -> pd.DataFrame:
     """
-    Assign nested quotas to prompted users
+    Assign nested quotas to prompted users with constraint respect
     
     Args:
         df_subset: DataFrame of users to assign
         level_configs: List of level configurations with name, options, and percentages
         constraint_columns: List of columns to respect as constraints
+        constraint_mappings: Dict mapping level names to their constraint columns
     
     Returns:
         DataFrame with assignment columns added
@@ -46,8 +48,29 @@ def assign_nested_quotas(df_subset: pd.DataFrame, level_configs: List[Dict], con
     remaining_indices = result_df.index.tolist()
     assignments = {level['name']: [None] * len(result_df) for level in level_configs}
     
+    def get_valid_options_for_user(idx, level_name, options):
+        """Get valid options for a user based on constraints"""
+        # Check if this level has a constraint mapping
+        if level_name not in constraint_mappings or not constraint_mappings[level_name]:
+            # No constraint, all options valid
+            return [opt['value'] for opt in options]
+        
+        constraint_col = constraint_mappings[level_name]
+        user_preference = result_df.loc[idx, constraint_col]
+        
+        # If user has "Either" or similar flexible preference, all options valid
+        if str(user_preference).lower() == 'either':
+            return [opt['value'] for opt in options]
+        
+        # Otherwise, only return matching option if it exists
+        matching_options = [opt['value'] for opt in options 
+                          if opt['value'].lower() == str(user_preference).lower()]
+        
+        # If no exact match found, return all options (fallback)
+        return matching_options if matching_options else [opt['value'] for opt in options]
+    
     def assign_level(indices: List, level_idx: int, parent_assignment: str = None):
-        """Recursively assign quotas at each level"""
+        """Recursively assign quotas at each level with constraint respect"""
         if level_idx >= len(level_configs):
             return
         
@@ -55,37 +78,60 @@ def assign_nested_quotas(df_subset: pd.DataFrame, level_configs: List[Dict], con
         level_name = level['name']
         options = level['options']
         
-        # Calculate target counts for each option
+        # Separate indices by their constraint eligibility
+        indices_by_option = {opt['value']: [] for opt in options}
+        flexible_indices = []  # Users who can go to any option (have "Either")
+        
+        for idx in indices:
+            valid_options = get_valid_options_for_user(idx, level_name, options)
+            
+            if len(valid_options) == len(options):
+                # User is flexible (has "Either" or no constraint)
+                flexible_indices.append(idx)
+            elif len(valid_options) == 1:
+                # User has specific constraint
+                indices_by_option[valid_options[0]].append(idx)
+            else:
+                # Multiple valid options but not all - treat as flexible
+                flexible_indices.append(idx)
+        
+        # Calculate targets
         total_at_level = len(indices)
         targets = {}
         cumulative = 0
         
         for i, opt in enumerate(options):
             if i == len(options) - 1:
-                # Last option gets remainder to handle rounding
                 targets[opt['value']] = total_at_level - cumulative
             else:
                 targets[opt['value']] = int(total_at_level * opt['percentage'] / 100)
                 cumulative += targets[opt['value']]
         
-        # Shuffle indices for random assignment
-        shuffled_indices = indices.copy()
-        np.random.shuffle(shuffled_indices)
-        
-        # Assign each option
+        # Assign constrained users first
         assigned_by_option = {}
-        start_idx = 0
-        
-        for opt_value, target_count in targets.items():
-            end_idx = start_idx + target_count
-            assigned_indices = shuffled_indices[start_idx:end_idx]
-            assigned_by_option[opt_value] = assigned_indices
+        for opt_value in targets.keys():
+            constrained = indices_by_option[opt_value]
+            assigned_by_option[opt_value] = constrained[:targets[opt_value]]
             
             # Record assignments
-            for idx in assigned_indices:
+            for idx in assigned_by_option[opt_value]:
                 assignments[level_name][result_df.index.get_loc(idx)] = opt_value
+        
+        # Distribute flexible users to meet targets
+        np.random.shuffle(flexible_indices)
+        flexible_idx = 0
+        
+        for opt_value, target_count in targets.items():
+            current_count = len(assigned_by_option[opt_value])
+            needed = target_count - current_count
             
-            start_idx = end_idx
+            # Assign flexible users to meet target
+            while needed > 0 and flexible_idx < len(flexible_indices):
+                idx = flexible_indices[flexible_idx]
+                assigned_by_option[opt_value].append(idx)
+                assignments[level_name][result_df.index.get_loc(idx)] = opt_value
+                flexible_idx += 1
+                needed -= 1
         
         # Recursively assign next level within each option
         if level_idx + 1 < len(level_configs):
@@ -137,7 +183,7 @@ def assign_retailer(df_subset: pd.DataFrame, retailer_col: str) -> pd.DataFrame:
 
 def segment_audience(df: pd.DataFrame, prompted_count: int, unprompted_count: int, 
                      retailer_col: str, constraint_columns: List[str], 
-                     level_configs: List[Dict]) -> pd.DataFrame:
+                     level_configs: List[Dict], constraint_mappings: Dict[str, str]) -> pd.DataFrame:
     """
     Main segmentation function
     
@@ -148,6 +194,7 @@ def segment_audience(df: pd.DataFrame, prompted_count: int, unprompted_count: in
         retailer_col: Name of retailer column
         constraint_columns: Additional constraint columns for prompted users
         level_configs: List of level configurations
+        constraint_mappings: Dict mapping level names to their constraint columns
     
     Returns:
         DataFrame with segmentation assignments
@@ -172,7 +219,7 @@ def segment_audience(df: pd.DataFrame, prompted_count: int, unprompted_count: in
     
     # Process prompted users - apply nested quotas
     if level_configs:
-        prompted_df = assign_nested_quotas(prompted_df, level_configs, constraint_columns)
+        prompted_df = assign_nested_quotas(prompted_df, level_configs, constraint_columns, constraint_mappings)
     
     # Assign retailers for prompted and unprompted (not for backups)
     prompted_df = assign_retailer(prompted_df, retailer_col)
@@ -378,6 +425,46 @@ def main():
                         "name": level3_name,
                         "options": level3_options
                     })
+            
+            # Constraint Mapping Section
+            if level_configs and constraint_columns:
+                st.markdown("---")
+                st.subheader("🔗 Map Constraints to Assignment Levels")
+                st.markdown("*Optional: Link constraint columns to assignment levels to respect user preferences*")
+                st.info("💡 Example: Map 'Cooking Preference' to 'Cooking Method' so users with 'Soup' preference only get 'Soup' assignments")
+                
+                constraint_mappings = {}
+                
+                for level in level_configs:
+                    level_name = level['name']
+                    
+                    col1, col2 = st.columns([1, 2])
+                    with col1:
+                        st.write(f"**{level_name}**")
+                    with col2:
+                        mapping_options = ["None (no constraint)"] + constraint_columns
+                        selected_constraint = st.selectbox(
+                            f"Constraint for {level_name}",
+                            options=mapping_options,
+                            key=f"constraint_map_{level_name}",
+                            help=f"Select which constraint column should be respected when assigning {level_name}"
+                        )
+                        
+                        if selected_constraint != "None (no constraint)":
+                            constraint_mappings[level_name] = selected_constraint
+                        else:
+                            constraint_mappings[level_name] = None
+                
+                # Show mapping summary
+                if any(constraint_mappings.values()):
+                    st.success("✓ Active constraint mappings:")
+                    for level_name, constraint_col in constraint_mappings.items():
+                        if constraint_col:
+                            st.write(f"  - {level_name} respects {constraint_col}")
+            else:
+                constraint_mappings = {}
+        else:
+            constraint_mappings = {}
         
         # Step 6: Run Segmentation
         st.header("6. Run Segmentation")
@@ -394,7 +481,8 @@ def main():
                     unprompted_count=unprompted_count,
                     retailer_col=retailer_col,
                     constraint_columns=constraint_columns,
-                    level_configs=level_configs
+                    level_configs=level_configs,
+                    constraint_mappings=constraint_mappings
                 )
                 
                 st.session_state.result_df = result_df
