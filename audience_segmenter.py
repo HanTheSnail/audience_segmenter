@@ -17,8 +17,9 @@ def initialize_session_state():
 
 def validate_sample_sizes(prompted, unprompted, total):
     """Check if sample sizes are valid"""
-    if prompted + unprompted != total:
-        return False, f"Prompted ({prompted}) + Unprompted ({unprompted}) must equal total rows ({total})"
+    selected_total = prompted + unprompted
+    if selected_total > total:
+        return False, f"Prompted ({prompted}) + Unprompted ({unprompted}) = {selected_total} exceeds total rows ({total})"
     if prompted < 0 or unprompted < 0:
         return False, "Sample sizes must be positive numbers"
     return True, ""
@@ -156,24 +157,37 @@ def segment_audience(df: pd.DataFrame, prompted_count: int, unprompted_count: in
     # Shuffle the dataframe
     result_df = result_df.sample(frac=1).reset_index(drop=True)
     
-    # Split into prompted and unprompted
+    # Calculate total selected
+    total_selected = prompted_count + unprompted_count
+    
+    # Split into prompted, unprompted, and backup
     prompted_df = result_df.iloc[:prompted_count].copy()
-    unprompted_df = result_df.iloc[prompted_count:prompted_count + unprompted_count].copy()
+    unprompted_df = result_df.iloc[prompted_count:total_selected].copy()
+    backup_df = result_df.iloc[total_selected:].copy()
     
     # Add segment type column
     prompted_df['Segment_Type'] = 'Prompted'
     unprompted_df['Segment_Type'] = 'Unprompted'
+    backup_df['Segment_Type'] = 'Backup'
     
     # Process prompted users - apply nested quotas
     if level_configs:
         prompted_df = assign_nested_quotas(prompted_df, level_configs, constraint_columns)
     
-    # Assign retailers for both groups
+    # Assign retailers for prompted and unprompted (not for backups)
     prompted_df = assign_retailer(prompted_df, retailer_col)
     unprompted_df = assign_retailer(unprompted_df, retailer_col)
     
+    # For backups, don't assign anything - just add the column as None
+    backup_df['Assigned_Retailer'] = None
+    
+    # Add None values for level columns in backup
+    if level_configs:
+        for level in level_configs:
+            backup_df[level['name']] = None
+    
     # Combine results
-    final_df = pd.concat([prompted_df, unprompted_df], ignore_index=True)
+    final_df = pd.concat([prompted_df, unprompted_df, backup_df], ignore_index=True)
     
     return final_df
 
@@ -200,25 +214,34 @@ def main():
         
         # Step 2: Set Sample Sizes
         st.header("2. Set Sample Sizes")
-        col1, col2, col3 = st.columns(3)
+        st.markdown("*Select how many people you need - remaining will be marked as Backups*")
+        
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            prompted_count = st.number_input("Prompted users", min_value=0, max_value=total_rows, value=min(70, total_rows))
+            prompted_count = st.number_input("Prompted users", min_value=0, max_value=total_rows, value=min(50, total_rows))
         
         with col2:
-            unprompted_count = st.number_input("Unprompted users", min_value=0, max_value=total_rows, value=min(30, total_rows))
+            unprompted_count = st.number_input("Unprompted users", min_value=0, max_value=total_rows, value=min(20, total_rows))
         
         with col3:
             total_selected = prompted_count + unprompted_count
-            if total_selected == total_rows:
-                st.metric("Total", f"{total_selected} ✓", delta=None)
+            backup_count = total_rows - total_selected
+            st.metric("Selected", f"{total_selected}")
+        
+        with col4:
+            if backup_count > 0:
+                st.metric("Backups", f"{backup_count}", delta=None, delta_color="off")
             else:
-                st.metric("Total", f"{total_selected} ⚠️", delta=f"{total_selected - total_rows}")
+                st.metric("Backups", "0")
         
         valid, error_msg = validate_sample_sizes(prompted_count, unprompted_count, total_rows)
         if not valid:
             st.error(error_msg)
             return
+        
+        if backup_count > 0:
+            st.info(f"ℹ️ {backup_count} participants will be marked as 'Backup' (unassigned)")
         
         # Step 3: Select Retailer Column
         st.header("3. Select Retailer Column")
@@ -384,7 +407,7 @@ def main():
             result_df = st.session_state.result_df
             
             # Summary Statistics
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             
             with col1:
                 prompted = (result_df['Segment_Type'] == 'Prompted').sum()
@@ -395,6 +418,10 @@ def main():
                 st.metric("Unprompted Users", unprompted)
             
             with col3:
+                backups = (result_df['Segment_Type'] == 'Backup').sum()
+                st.metric("Backups", backups)
+            
+            with col4:
                 st.metric("Total", len(result_df))
             
             # Detailed Breakdown
