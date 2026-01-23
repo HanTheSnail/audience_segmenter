@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set
 import io
+import re
 
 st.set_page_config(page_title="Audience Segmentation Tool", layout="wide")
 
@@ -14,6 +15,71 @@ def initialize_session_state():
         st.session_state.constraint_columns = []
     if 'level_configs' not in st.session_state:
         st.session_state.level_configs = []
+    if 'column_metadata' not in st.session_state:
+        st.session_state.column_metadata = {}
+
+def analyze_column_values(df: pd.DataFrame, column: str) -> Dict:
+    """
+    Analyze a column to extract unique values and detect 'flexible' responses
+    
+    Returns dict with:
+    - all_values: all unique values
+    - specific_values: values that aren't flexible (e.g., not "Both", "Either")
+    - flexible_values: values indicating flexibility
+    - flexible_pattern: regex pattern for flexible responses
+    """
+    all_values = df[column].dropna().unique().tolist()
+    
+    # Common patterns for flexible responses
+    flexible_keywords = ['both', 'either', 'any', 'no preference', "don't mind", 'all']
+    
+    flexible_values = []
+    specific_values = []
+    
+    for val in all_values:
+        val_lower = str(val).lower().strip()
+        is_flexible = any(keyword in val_lower for keyword in flexible_keywords)
+        
+        if is_flexible:
+            flexible_values.append(val)
+        else:
+            specific_values.append(val)
+    
+    return {
+        'all_values': all_values,
+        'specific_values': specific_values,
+        'flexible_values': flexible_values,
+        'column': column
+    }
+
+def extract_options_from_value(value: str, known_options: List[str]) -> List[str]:
+    """
+    Extract specific options from a compound value like "Both chicken or beef"
+    
+    Args:
+        value: The value to parse (e.g., "Both chicken or beef")
+        known_options: List of known specific options (e.g., ["Chicken", "Beef"])
+    
+    Returns:
+        List of matched options, or all options if flexible
+    """
+    value_lower = str(value).lower().strip()
+    
+    # Check if it's a flexible response
+    flexible_keywords = ['both', 'either', 'any', 'no preference', "don't mind", 'all']
+    is_flexible = any(keyword in value_lower for keyword in flexible_keywords)
+    
+    if is_flexible:
+        return known_options  # Return all options for flexible responses
+    
+    # Try to match specific options
+    matched = []
+    for option in known_options:
+        if option.lower() in value_lower:
+            matched.append(option)
+    
+    # If we found matches, return them; otherwise return the original value
+    return matched if matched else [value]
 
 def validate_sample_sizes(prompted, unprompted, total):
     """Check if sample sizes are valid"""
@@ -25,15 +91,15 @@ def validate_sample_sizes(prompted, unprompted, total):
     return True, ""
 
 def assign_nested_quotas(df_subset: pd.DataFrame, level_configs: List[Dict], 
-                        constraint_columns: List[str], constraint_mappings: Dict[str, str]) -> pd.DataFrame:
+                        constraint_mappings: Dict[str, Dict]) -> pd.DataFrame:
     """
-    Assign nested quotas to prompted users with constraint respect
+    Assign nested quotas to prompted users with intelligent constraint respect
     
     Args:
         df_subset: DataFrame of users to assign
         level_configs: List of level configurations with name, options, and percentages
-        constraint_columns: List of columns to respect as constraints
-        constraint_mappings: Dict mapping level names to their constraint columns
+        constraint_mappings: Dict mapping level names to constraint config
+            e.g., {'Product_Variant': {'column': 'Flavour', 'specific_values': ['Chicken', 'Beef']}}
     
     Returns:
         DataFrame with assignment columns added
@@ -52,22 +118,28 @@ def assign_nested_quotas(df_subset: pd.DataFrame, level_configs: List[Dict],
         """Get valid options for a user based on constraints"""
         # Check if this level has a constraint mapping
         if level_name not in constraint_mappings or not constraint_mappings[level_name]:
-            # No constraint, all options valid
             return [opt['value'] for opt in options]
         
-        constraint_col = constraint_mappings[level_name]
-        user_preference = result_df.loc[idx, constraint_col]
+        constraint_config = constraint_mappings[level_name]
+        constraint_col = constraint_config['column']
+        specific_values = constraint_config['specific_values']
         
-        # If user has "Either" or similar flexible preference, all options valid
-        if str(user_preference).lower() == 'either':
-            return [opt['value'] for opt in options]
+        user_value = result_df.loc[idx, constraint_col]
         
-        # Otherwise, only return matching option if it exists
-        matching_options = [opt['value'] for opt in options 
-                          if opt['value'].lower() == str(user_preference).lower()]
+        # Extract which specific options this user is eligible for
+        eligible_options = extract_options_from_value(user_value, specific_values)
         
-        # If no exact match found, return all options (fallback)
-        return matching_options if matching_options else [opt['value'] for opt in options]
+        # Match against assignment options
+        valid_assignment_options = []
+        for opt in options:
+            # Check if this assignment option matches any eligible option
+            opt_lower = opt['value'].lower()
+            if any(eligible.lower() in opt_lower or opt_lower in eligible.lower() 
+                   for eligible in eligible_options):
+                valid_assignment_options.append(opt['value'])
+        
+        # If no matches found, allow all (fallback)
+        return valid_assignment_options if valid_assignment_options else [opt['value'] for opt in options]
     
     def assign_level(indices: List, level_idx: int, parent_assignment: str = None):
         """Recursively assign quotas at each level with constraint respect"""
@@ -80,19 +152,19 @@ def assign_nested_quotas(df_subset: pd.DataFrame, level_configs: List[Dict],
         
         # Separate indices by their constraint eligibility
         indices_by_option = {opt['value']: [] for opt in options}
-        flexible_indices = []  # Users who can go to any option (have "Either")
+        flexible_indices = []
         
         for idx in indices:
             valid_options = get_valid_options_for_user(idx, level_name, options)
             
             if len(valid_options) == len(options):
-                # User is flexible (has "Either" or no constraint)
+                # User is flexible
                 flexible_indices.append(idx)
             elif len(valid_options) == 1:
                 # User has specific constraint
                 indices_by_option[valid_options[0]].append(idx)
             else:
-                # Multiple valid options but not all - treat as flexible
+                # Multiple valid but not all - treat as flexible
                 flexible_indices.append(idx)
         
         # Calculate targets
@@ -147,58 +219,58 @@ def assign_nested_quotas(df_subset: pd.DataFrame, level_configs: List[Dict],
     
     return result_df
 
-def assign_retailer(df_subset: pd.DataFrame, retailer_col: str) -> pd.DataFrame:
-    """Assign retailer based on preference, balancing 'Either' across options"""
+def assign_retailer(df_subset: pd.DataFrame, retailer_col: str, 
+                   retailer_metadata: Dict) -> pd.DataFrame:
+    """Assign retailer based on preference, intelligently handling flexible responses"""
     result_df = df_subset.copy()
     result_df['Assigned_Retailer'] = None
     
-    # Get unique retailers (excluding 'Either')
-    all_retailers = result_df[retailer_col].unique()
-    specific_retailers = [r for r in all_retailers if r.lower() != 'either']
+    specific_retailers = retailer_metadata['specific_values']
+    flexible_values = retailer_metadata['flexible_values']
     
     # First pass: assign specific preferences
-    for retailer in specific_retailers:
-        mask = result_df[retailer_col] == retailer
-        result_df.loc[mask, 'Assigned_Retailer'] = retailer
+    for idx in result_df.index:
+        user_value = result_df.loc[idx, retailer_col]
+        eligible_retailers = extract_options_from_value(user_value, specific_retailers)
+        
+        # If only one eligible retailer, assign it
+        if len(eligible_retailers) == 1:
+            result_df.loc[idx, 'Assigned_Retailer'] = eligible_retailers[0]
     
-    # Second pass: distribute 'Either' to balance retailers
-    either_mask = result_df[retailer_col].str.lower() == 'either'
-    either_indices = result_df[either_mask].index.tolist()
+    # Second pass: distribute flexible users to balance retailers
+    unassigned_mask = result_df['Assigned_Retailer'].isna()
+    unassigned_indices = result_df[unassigned_mask].index.tolist()
     
-    if either_indices and specific_retailers:
+    if unassigned_indices and specific_retailers:
         # Count current assignments
         retailer_counts = result_df['Assigned_Retailer'].value_counts().to_dict()
         
-        # Shuffle 'Either' users
-        np.random.shuffle(either_indices)
+        # Initialize counts for retailers with no assignments
+        for retailer in specific_retailers:
+            if retailer not in retailer_counts:
+                retailer_counts[retailer] = 0
+        
+        # Shuffle unassigned users
+        np.random.shuffle(unassigned_indices)
         
         # Assign to balance retailers
-        for idx in either_indices:
-            # Find retailer with lowest count
-            min_retailer = min(specific_retailers, key=lambda r: retailer_counts.get(r, 0))
-            result_df.loc[idx, 'Assigned_Retailer'] = min_retailer
-            retailer_counts[min_retailer] = retailer_counts.get(min_retailer, 0) + 1
+        for idx in unassigned_indices:
+            user_value = result_df.loc[idx, retailer_col]
+            eligible_retailers = extract_options_from_value(user_value, specific_retailers)
+            
+            # Among eligible retailers, choose the one with lowest count
+            if eligible_retailers:
+                min_retailer = min(eligible_retailers, 
+                                 key=lambda r: retailer_counts.get(r, 0))
+                result_df.loc[idx, 'Assigned_Retailer'] = min_retailer
+                retailer_counts[min_retailer] = retailer_counts.get(min_retailer, 0) + 1
     
     return result_df
 
 def segment_audience(df: pd.DataFrame, prompted_count: int, unprompted_count: int, 
-                     retailer_col: str, constraint_columns: List[str], 
-                     level_configs: List[Dict], constraint_mappings: Dict[str, str]) -> pd.DataFrame:
-    """
-    Main segmentation function
-    
-    Args:
-        df: Input DataFrame
-        prompted_count: Number of prompted users
-        unprompted_count: Number of unprompted users
-        retailer_col: Name of retailer column
-        constraint_columns: Additional constraint columns for prompted users
-        level_configs: List of level configurations
-        constraint_mappings: Dict mapping level names to their constraint columns
-    
-    Returns:
-        DataFrame with segmentation assignments
-    """
+                     retailer_col: str, retailer_metadata: Dict,
+                     level_configs: List[Dict], constraint_mappings: Dict[str, Dict]) -> pd.DataFrame:
+    """Main segmentation function"""
     result_df = df.copy()
     
     # Shuffle the dataframe
@@ -219,13 +291,13 @@ def segment_audience(df: pd.DataFrame, prompted_count: int, unprompted_count: in
     
     # Process prompted users - apply nested quotas
     if level_configs:
-        prompted_df = assign_nested_quotas(prompted_df, level_configs, constraint_columns, constraint_mappings)
+        prompted_df = assign_nested_quotas(prompted_df, level_configs, constraint_mappings)
     
-    # Assign retailers for prompted and unprompted (not for backups)
-    prompted_df = assign_retailer(prompted_df, retailer_col)
-    unprompted_df = assign_retailer(unprompted_df, retailer_col)
+    # Assign retailers for prompted and unprompted
+    prompted_df = assign_retailer(prompted_df, retailer_col, retailer_metadata)
+    unprompted_df = assign_retailer(unprompted_df, retailer_col, retailer_metadata)
     
-    # For backups, don't assign anything - just add the column as None
+    # For backups, don't assign anything
     backup_df['Assigned_Retailer'] = None
     
     # Add None values for level columns in backup
@@ -238,9 +310,31 @@ def segment_audience(df: pd.DataFrame, prompted_count: int, unprompted_count: in
     
     return final_df
 
+def display_column_insights(metadata: Dict, column_name: str):
+    """Display insights about a column's values"""
+    st.markdown(f"**{column_name}** - Detected values:")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("*Specific options:*")
+        if metadata['specific_values']:
+            for val in metadata['specific_values']:
+                st.markdown(f"- {val}")
+        else:
+            st.markdown("*None detected*")
+    
+    with col2:
+        st.markdown("*Flexible responses:*")
+        if metadata['flexible_values']:
+            for val in metadata['flexible_values']:
+                st.markdown(f"- {val}")
+        else:
+            st.markdown("*None detected*")
+
 def main():
     st.title("🎯 Audience Segmentation Tool")
-    st.markdown("Segment your audience with flexible nested quotas and constraints")
+    st.markdown("Segment your audience with flexible nested quotas and intelligent constraint handling")
     
     initialize_session_state()
     
@@ -296,8 +390,14 @@ def main():
         
         retailer_col = st.selectbox("Retailer Column", options=df.columns.tolist())
         
-        # Show retailer distribution
-        with st.expander("View Retailer Distribution"):
+        # Analyze retailer column
+        retailer_metadata = analyze_column_values(df, retailer_col)
+        
+        with st.expander("View Retailer Analysis", expanded=True):
+            display_column_insights(retailer_metadata, retailer_col)
+            
+            st.markdown("---")
+            st.markdown("*Distribution:*")
             retailer_counts = df[retailer_col].value_counts()
             st.bar_chart(retailer_counts)
         
@@ -307,18 +407,27 @@ def main():
         
         add_constraints = st.checkbox("Add constraint columns")
         constraint_columns = []
+        constraint_metadata = {}
         
         if add_constraints:
             available_cols = [col for col in df.columns.tolist() if col != retailer_col]
             constraint_columns = st.multiselect(
                 "Select constraint columns",
                 options=available_cols,
-                help="e.g., Cooking Preference, Flavour Preference"
+                help="e.g., Flavour, Cooking Method"
             )
             
             if constraint_columns:
                 for col in constraint_columns:
-                    with st.expander(f"View {col} Distribution"):
+                    # Analyze each constraint column
+                    metadata = analyze_column_values(df, col)
+                    constraint_metadata[col] = metadata
+                    
+                    with st.expander(f"View {col} Analysis"):
+                        display_column_insights(metadata, col)
+                        
+                        st.markdown("---")
+                        st.markdown("*Distribution:*")
                         col_counts = df[col].value_counts()
                         st.bar_chart(col_counts)
         
@@ -327,6 +436,7 @@ def main():
         
         add_assignment = st.checkbox("Add product/variant assignment")
         level_configs = []
+        constraint_mappings = {}
         
         if add_assignment:
             # Level 1
@@ -357,6 +467,28 @@ def main():
                 "name": level1_name,
                 "options": level1_options
             })
+            
+            # Constraint mapping for Level 1
+            if constraint_columns:
+                st.markdown("**🔗 Constraint Mapping for Level 1**")
+                mapping_options = ["None (no constraint)"] + constraint_columns
+                
+                selected_constraint = st.selectbox(
+                    f"Link {level1_name} to constraint",
+                    options=mapping_options,
+                    key=f"constraint_map_level1",
+                    help=f"Select which constraint column should be respected when assigning {level1_name}"
+                )
+                
+                if selected_constraint != "None (no constraint)":
+                    constraint_mappings[level1_name] = {
+                        'column': selected_constraint,
+                        'specific_values': constraint_metadata[selected_constraint]['specific_values']
+                    }
+                    
+                    # Show the mapping
+                    st.success(f"✓ {level1_name} will respect {selected_constraint} preferences")
+                    st.info(f"Specific values to match: {', '.join(constraint_metadata[selected_constraint]['specific_values'])}")
             
             # Level 2
             add_level2 = st.checkbox("Add Level 2 (nested within Level 1)")
@@ -392,6 +524,27 @@ def main():
                     "options": level2_options
                 })
                 
+                # Constraint mapping for Level 2
+                if constraint_columns:
+                    st.markdown("**🔗 Constraint Mapping for Level 2**")
+                    mapping_options = ["None (no constraint)"] + constraint_columns
+                    
+                    selected_constraint = st.selectbox(
+                        f"Link {level2_name} to constraint",
+                        options=mapping_options,
+                        key=f"constraint_map_level2",
+                        help=f"Select which constraint column should be respected when assigning {level2_name}"
+                    )
+                    
+                    if selected_constraint != "None (no constraint)":
+                        constraint_mappings[level2_name] = {
+                            'column': selected_constraint,
+                            'specific_values': constraint_metadata[selected_constraint]['specific_values']
+                        }
+                        
+                        st.success(f"✓ {level2_name} will respect {selected_constraint} preferences")
+                        st.info(f"Specific values to match: {', '.join(constraint_metadata[selected_constraint]['specific_values'])}")
+                
                 # Level 3
                 add_level3 = st.checkbox("Add Level 3 (nested within Level 2)")
                 
@@ -425,46 +578,34 @@ def main():
                         "name": level3_name,
                         "options": level3_options
                     })
-            
-            # Constraint Mapping Section
-            if level_configs and constraint_columns:
-                st.markdown("---")
-                st.subheader("🔗 Map Constraints to Assignment Levels")
-                st.markdown("*Optional: Link constraint columns to assignment levels to respect user preferences*")
-                st.info("💡 Example: Map 'Cooking Preference' to 'Cooking Method' so users with 'Soup' preference only get 'Soup' assignments")
-                
-                constraint_mappings = {}
-                
-                for level in level_configs:
-                    level_name = level['name']
                     
-                    col1, col2 = st.columns([1, 2])
-                    with col1:
-                        st.write(f"**{level_name}**")
-                    with col2:
+                    # Constraint mapping for Level 3
+                    if constraint_columns:
+                        st.markdown("**🔗 Constraint Mapping for Level 3**")
                         mapping_options = ["None (no constraint)"] + constraint_columns
+                        
                         selected_constraint = st.selectbox(
-                            f"Constraint for {level_name}",
+                            f"Link {level3_name} to constraint",
                             options=mapping_options,
-                            key=f"constraint_map_{level_name}",
-                            help=f"Select which constraint column should be respected when assigning {level_name}"
+                            key=f"constraint_map_level3",
+                            help=f"Select which constraint column should be respected when assigning {level3_name}"
                         )
                         
                         if selected_constraint != "None (no constraint)":
-                            constraint_mappings[level_name] = selected_constraint
-                        else:
-                            constraint_mappings[level_name] = None
-                
-                # Show mapping summary
-                if any(constraint_mappings.values()):
-                    st.success("✓ Active constraint mappings:")
-                    for level_name, constraint_col in constraint_mappings.items():
-                        if constraint_col:
-                            st.write(f"  - {level_name} respects {constraint_col}")
-            else:
-                constraint_mappings = {}
-        else:
-            constraint_mappings = {}
+                            constraint_mappings[level3_name] = {
+                                'column': selected_constraint,
+                                'specific_values': constraint_metadata[selected_constraint]['specific_values']
+                            }
+                            
+                            st.success(f"✓ {level3_name} will respect {selected_constraint} preferences")
+                            st.info(f"Specific values to match: {', '.join(constraint_metadata[selected_constraint]['specific_values'])}")
+            
+            # Show mapping summary
+            if constraint_mappings:
+                st.markdown("---")
+                st.success("📋 **Active Constraint Mappings Summary:**")
+                for level_name, mapping_config in constraint_mappings.items():
+                    st.write(f"  - **{level_name}** respects **{mapping_config['column']}** ({', '.join(mapping_config['specific_values'])})")
         
         # Step 6: Run Segmentation
         st.header("6. Run Segmentation")
@@ -480,7 +621,7 @@ def main():
                     prompted_count=prompted_count,
                     unprompted_count=unprompted_count,
                     retailer_col=retailer_col,
-                    constraint_columns=constraint_columns,
+                    retailer_metadata=retailer_metadata,
                     level_configs=level_configs,
                     constraint_mappings=constraint_mappings
                 )
@@ -513,7 +654,7 @@ def main():
                 st.metric("Total", len(result_df))
             
             # Detailed Breakdown
-            tabs = st.tabs(["Distribution Summary", "Full Data Preview"])
+            tabs = st.tabs(["Distribution Summary", "Constraint Validation", "Full Data Preview"])
             
             with tabs[0]:
                 # Retailer distribution
@@ -543,6 +684,50 @@ def main():
                         st.dataframe(crosstab, use_container_width=True)
             
             with tabs[1]:
+                if constraint_mappings and level_configs:
+                    st.subheader("Constraint Compliance Check")
+                    st.markdown("*Verify that assignments respect user preferences*")
+                    
+                    prompted_df = result_df[result_df['Segment_Type'] == 'Prompted'].copy()
+                    
+                    for level_name, mapping_config in constraint_mappings.items():
+                        st.markdown(f"**{level_name} vs {mapping_config['column']}**")
+                        
+                        # Create a validation column
+                        def validate_assignment(row):
+                            user_pref = row[mapping_config['column']]
+                            assignment = row[level_name]
+                            
+                            # Extract eligible options for this user
+                            eligible = extract_options_from_value(user_pref, mapping_config['specific_values'])
+                            
+                            # Check if assignment matches
+                            if any(opt.lower() in str(assignment).lower() or 
+                                   str(assignment).lower() in opt.lower() 
+                                   for opt in eligible):
+                                return "✓ Valid"
+                            else:
+                                return "⚠ Check"
+                        
+                        prompted_df['Validation'] = prompted_df.apply(validate_assignment, axis=1)
+                        
+                        # Show validation summary
+                        validation_summary = prompted_df['Validation'].value_counts()
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Valid Assignments", validation_summary.get("✓ Valid", 0))
+                        with col2:
+                            st.metric("Need Review", validation_summary.get("⚠ Check", 0))
+                        
+                        # Show sample of assignments
+                        sample_df = prompted_df[[mapping_config['column'], level_name, 'Validation']].head(20)
+                        st.dataframe(sample_df, use_container_width=True)
+                        st.markdown("---")
+                else:
+                    st.info("No constraint mappings configured - skipping validation")
+            
+            with tabs[2]:
                 st.dataframe(result_df, use_container_width=True)
             
             # Download
